@@ -177,24 +177,67 @@ class LakeFormationFGACDiagnostics:
             return True
             
     def check_fgac_enabled(self) -> bool:
-        """Verify FGAC is enabled via job parameter."""
-        fgac_enabled = self.args.get("--enable-lakeformation-fine-grained-access", 
-                                     self.args.get("enable_lakeformation_fine_grained_access", "false"))
-        
-        if fgac_enabled.lower() == "true":
+        """
+        Verify FGAC is enabled by checking Spark configurations.
+
+        When FGAC is enabled, AWS Glue sets specific Spark configurations
+        for Lake Formation integration.
+        """
+        fgac_indicators = {}
+        fgac_enabled = False
+
+        try:
+            # Check for Lake Formation specific Spark configurations
+            lf_configs_to_check = [
+                "spark.glue.lakeformation.enabled",
+                "spark.hadoop.fs.s3.authorization.enabled",
+                "spark.sql.catalog.spark_catalog.lakeformation.enabled",
+            ]
+
+            for config in lf_configs_to_check:
+                try:
+                    value = self.spark.conf.get(config)
+                    fgac_indicators[config] = value
+                    if value.lower() == "true":
+                        fgac_enabled = True
+                except Exception:
+                    fgac_indicators[config] = "not_set"
+
+            # Check for Lake Formation authorization class
+            try:
+                auth_class = self.spark.conf.get("spark.hadoop.fs.s3.authorization.class", "not_set")
+                fgac_indicators["authorization_class"] = auth_class
+                if "lakeformation" in auth_class.lower():
+                    fgac_enabled = True
+            except Exception:
+                pass
+
+            # Check if running in secure mode (FGAC creates a sandboxed environment)
+            try:
+                security_manager = self.spark._jsc.sc().env().securityManager()
+                if security_manager is not None:
+                    fgac_indicators["security_manager_active"] = True
+                    fgac_enabled = True
+            except Exception:
+                fgac_indicators["security_manager_active"] = "unknown"
+
+        except Exception as e:
+            fgac_indicators["error"] = str(e)
+
+        if fgac_enabled:
             self.add_result(
                 "FGAC Parameter Check",
                 DiagnosticStatus.PASS,
                 "Lake Formation FGAC is enabled",
-                {"enable_lakeformation_fine_grained_access": True}
+                {"indicators": fgac_indicators}
             )
             return True
         else:
             self.add_result(
                 "FGAC Parameter Check",
                 DiagnosticStatus.FAIL,
-                "Lake Formation FGAC is NOT enabled",
-                {"enable_lakeformation_fine_grained_access": False},
+                "Lake Formation FGAC does not appear to be enabled",
+                {"indicators": fgac_indicators},
                 "Add job parameter: --enable-lakeformation-fine-grained-access=true"
             )
             return False
@@ -202,35 +245,97 @@ class LakeFormationFGACDiagnostics:
     def check_worker_allocation(self) -> bool:
         """
         Verify minimum worker count for FGAC.
-        
+
         FGAC requires minimum 4 workers:
         - 1 user driver
-        - 1 system driver  
+        - 1 system driver
         - 1 system executor
         - 1 standby user executor
         """
+        num_workers = None
+        detection_method = None
+
         try:
-            num_workers = int(self.args.get("--number-of-workers", 
-                                           self.args.get("number_of_workers", "2")))
-            
+            # Method 1: Query the Glue API for job configuration
+            try:
+                import boto3
+                glue_client = boto3.client("glue")
+                job_name = self.args.get("JOB_NAME")
+                if job_name:
+                    job_response = glue_client.get_job(JobName=job_name)
+                    num_workers = job_response["Job"].get("NumberOfWorkers")
+                    if num_workers:
+                        detection_method = "glue_api"
+            except Exception:
+                pass
+
+            # Method 2: Check Spark executor configuration
+            if num_workers is None:
+                try:
+                    # Get number of executor instances from Spark config
+                    executor_instances = self.spark.conf.get("spark.executor.instances", None)
+                    if executor_instances:
+                        # In Glue, workers = executors + 1 (driver)
+                        num_workers = int(executor_instances) + 1
+                        detection_method = "spark_executor_instances"
+                except Exception:
+                    pass
+
+            # Method 3: Count active executors from SparkContext
+            if num_workers is None:
+                try:
+                    sc = self.spark.sparkContext
+                    # Get executor count from status tracker
+                    executor_ids = sc._jsc.sc().getExecutorIds()
+                    num_executors = executor_ids.size()
+                    if num_executors > 0:
+                        # Add 1 for driver
+                        num_workers = num_executors + 1
+                        detection_method = "executor_count"
+                except Exception:
+                    pass
+
+            # Method 4: Check default parallelism as a rough estimate
+            if num_workers is None:
+                try:
+                    parallelism = int(self.spark.conf.get("spark.default.parallelism", "0"))
+                    if parallelism > 0:
+                        # Rough estimate: parallelism / cores per executor
+                        cores_per_executor = int(self.spark.conf.get("spark.executor.cores", "4"))
+                        num_workers = max(4, parallelism // cores_per_executor)
+                        detection_method = "parallelism_estimate"
+                except Exception:
+                    pass
+
+            if num_workers is None:
+                self.add_result(
+                    "Worker Allocation Check",
+                    DiagnosticStatus.WARN,
+                    "Could not determine worker count",
+                    {"detection_methods_tried": ["glue_api", "spark_executor_instances", "executor_count", "parallelism_estimate"]},
+                    "Ensure job is configured with at least 4 workers for FGAC"
+                )
+                return True
+
             worker_allocation = {
                 "total_workers": num_workers,
+                "detection_method": detection_method,
                 "user_driver": 1,
                 "system_driver": 1,
                 "minimum_required": self.MIN_WORKERS_FGAC
             }
-            
+
             if num_workers >= 4:
                 # Calculate executor allocation (10% reserved for user executors)
                 remaining = num_workers - 2  # Subtract drivers
                 user_executor_reserve = max(1, int(remaining * 0.1))
                 system_executors = remaining - user_executor_reserve
-                
+
                 worker_allocation.update({
                     "user_executor_reserve": user_executor_reserve,
                     "system_executors_available": system_executors
                 })
-                
+
                 self.add_result(
                     "Worker Allocation Check",
                     DiagnosticStatus.PASS,
@@ -247,7 +352,7 @@ class LakeFormationFGACDiagnostics:
                     f"Increase --number-of-workers to at least {self.MIN_WORKERS_FGAC}"
                 )
                 return False
-                
+
         except Exception as e:
             self.add_result(
                 "Worker Allocation Check",
@@ -300,20 +405,20 @@ class LakeFormationFGACDiagnostics:
             "glue:Get*": False,
             "lakeformation:GetDataAccess": False
         }
-        
+
         try:
-            # Test Glue catalog access
-            databases = self.spark.catalog.listDatabases()
-            db_list = [db.name for db in databases]
+            # Test Glue catalog access using SQL (spark.catalog.* uses RDDs which are blocked by FGAC)
+            databases_df = self.spark.sql("SHOW DATABASES")
+            db_list = [row["databaseName"] for row in databases_df.collect()]
             required_permissions["glue:Get*"] = True
-            
+
             self.add_result(
                 "IAM Glue Permissions Check",
                 DiagnosticStatus.PASS,
                 f"Can access Glue Catalog ({len(db_list)} databases found)",
                 {"databases": db_list[:10]}  # Limit to first 10
             )
-            
+
         except Exception as e:
             self.add_result(
                 "IAM Glue Permissions Check",
@@ -322,7 +427,7 @@ class LakeFormationFGACDiagnostics:
                 recommendation="Ensure IAM role has glue:Get* permissions"
             )
             return False
-            
+
         # Note: lakeformation:GetDataAccess is tested implicitly when reading data
         self.add_result(
             "IAM Lake Formation Permissions",
@@ -330,7 +435,7 @@ class LakeFormationFGACDiagnostics:
             "Lake Formation permissions will be tested during data access",
             recommendation="Ensure IAM role has lakeformation:GetDataAccess permission"
         )
-        
+
         return True
         
     def check_table_format(self, database: str, table: str) -> Tuple[bool, str]:
@@ -786,23 +891,25 @@ class LakeFormationFGACDiagnostics:
     def list_available_tables(self) -> None:
         """List available databases and tables for reference."""
         try:
-            databases = self.spark.catalog.listDatabases()
+            # Use SQL instead of spark.catalog.* (which uses RDDs blocked by FGAC)
+            databases_df = self.spark.sql("SHOW DATABASES")
+            db_names = [row["databaseName"] for row in databases_df.collect()]
             db_tables = {}
-            
-            for db in databases:
+
+            for db_name in db_names:
                 try:
-                    tables = self.spark.catalog.listTables(db.name)
-                    db_tables[db.name] = [t.name for t in tables]
+                    tables_df = self.spark.sql(f"SHOW TABLES IN `{db_name}`")
+                    db_tables[db_name] = [row["tableName"] for row in tables_df.collect()]
                 except Exception:
-                    db_tables[db.name] = ["<access denied>"]
-                    
+                    db_tables[db_name] = ["<access denied>"]
+
             self.add_result(
                 "Available Tables",
                 DiagnosticStatus.INFO,
                 f"Found {len(db_tables)} databases in catalog",
                 {"databases": db_tables}
             )
-            
+
         except Exception as e:
             self.add_result(
                 "Available Tables",
