@@ -409,7 +409,9 @@ class LakeFormationFGACDiagnostics:
         try:
             # Test Glue catalog access using SQL (spark.catalog.* uses RDDs which are blocked by FGAC)
             databases_df = self.spark.sql("SHOW DATABASES")
-            db_list = [row["databaseName"] for row in databases_df.collect()]
+            # Column name varies by Spark/Glue version: databaseName, namespace, or name
+            col_name = databases_df.columns[0]
+            db_list = [row[col_name] for row in databases_df.collect()]
             required_permissions["glue:Get*"] = True
 
             self.add_result(
@@ -893,13 +895,17 @@ class LakeFormationFGACDiagnostics:
         try:
             # Use SQL instead of spark.catalog.* (which uses RDDs blocked by FGAC)
             databases_df = self.spark.sql("SHOW DATABASES")
-            db_names = [row["databaseName"] for row in databases_df.collect()]
+            # Column name varies by Spark/Glue version: databaseName, namespace, or name
+            db_col_name = databases_df.columns[0]
+            db_names = [row[db_col_name] for row in databases_df.collect()]
             db_tables = {}
 
             for db_name in db_names:
                 try:
                     tables_df = self.spark.sql(f"SHOW TABLES IN `{db_name}`")
-                    db_tables[db_name] = [row["tableName"] for row in tables_df.collect()]
+                    # Column name varies: tableName, table, or similar
+                    table_col_name = tables_df.columns[1] if len(tables_df.columns) > 1 else tables_df.columns[0]
+                    db_tables[db_name] = [row[table_col_name] for row in tables_df.collect()]
                 except Exception:
                     db_tables[db_name] = ["<access denied>"]
 
